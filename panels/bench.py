@@ -39,6 +39,23 @@ CONSOLE_COLORS = {
 }
 TEMP_REPORT = re.compile(r"^(?:ok\s+)?(B|C|T\d*):")
 
+# Stock Klipper sensor types that measure a real temperature (lower case).
+# Custom [thermistor x] / [adc_temperature x] types are added at runtime.
+TEMPERATURE_TYPES = {
+    # klippy/extras/temperature_sensors.cfg
+    "atc semitec 104gt-2", "atc semitec 104nt-4-r025h42g", "epcos 100k b57560g104f",
+    "generic 3950", "sliceengineering 450", "tdk ntcg104lh104jt1",
+    "honeywell 100k 135-104lag-j01", "ntc 100k mgb18-104f39050l32",
+    # adc_temperature.py
+    "ad595", "ad597", "ad8494", "ad8495", "ad8496", "ad8497", "pt100 ina826", "pt1000",
+    # spi_temperature.py
+    "max6675", "max31855", "max31856", "max31865",
+    # i2c / 1-wire / internal sensors
+    "aht10", "aht1x", "aht2x", "aht3x", "bme280", "bmp280", "bme680", "bmp180", "bmp388",
+    "ds18b20", "htu21d", "sht21", "si7013", "si7020", "si7021", "sht3x", "lm75", "mlx90614",
+    "temperature_mcu", "temperature_host", "temperature_combined", "temperature_hcu",
+}
+
 CSS = """
 .bench {{ font-size: {base}px; }}
 .bench_mono {{ font-family: monospace; font-size: {small}px; }}
@@ -171,15 +188,25 @@ class Panel(ScreenPanel):
         for name in self._printer.get_tools() + self._printer.get_heaters():
             if not name.startswith("extruder_stepper"):
                 result.append(name)
+        real_types = TEMPERATURE_TYPES | self._custom_temperature_types()
         for name in self._printer.get_temp_sensors():
             cfg = self._printer.get_config_section(name) or {}
-            # Fake temperature sensors such as the SFS flow readout are not temperatures
-            if cfg.get("sensor_type", "") == "filament_flow":
+            # Only real temperature sensors; readouts such as flow or force that
+            # Klipper exposes as temperature_sensor are left out
+            if cfg.get("sensor_type", "").strip().lower() not in real_types:
                 continue
             if name.split(" ", 1)[-1].startswith("_"):
                 continue
             result.append(name)
         return result
+
+    def _custom_temperature_types(self):
+        """Sensor types defined in printer.cfg with [thermistor x] or [adc_temperature x]."""
+        types = set()
+        for prefix in ("thermistor ", "adc_temperature "):
+            for section in self._printer.get_config_section_list(prefix):
+                types.add(section.split(" ", 1)[1].strip().lower())
+        return types
 
     @staticmethod
     def _short(name):
