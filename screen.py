@@ -384,6 +384,10 @@ class KlipperScreen(Gtk.ApplicationWindow):
             requested_updates["objects"][p] = ["value"]
         for led in self.printer.get_leds():
             requested_updates["objects"][led] = ["color_data"]
+        # Test bench sensors (filament encoder, load cell): all fields
+        for prefix in ("filament_encoder ", "load_cell"):
+            for obj in self.printer.get_config_section_list(prefix):
+                requested_updates["objects"][obj] = None
 
         self._ws.api.object_subscription(requested_updates)
 
@@ -917,8 +921,17 @@ class KlipperScreen(Gtk.ApplicationWindow):
             self.printer.state = "not ready"
             return
         self.files.refresh_files()
-        self.show_panel("main_menu", remove_all=True, items=self._config.get_menu_items("__main"))
+        self.show_home_panel()
         self.check_active_commands()
+
+    def show_home_panel(self, remove_all=True):
+        """Show the stock main menu, or the test bench dashboard when enabled."""
+        if self._config.get_main_config().getboolean("bench_layout", False):
+            self.show_panel("bench", remove_all=remove_all)
+        else:
+            self.show_panel(
+                "main_menu", remove_all=remove_all, items=self._config.get_menu_items("__main")
+            )
 
     def state_startup(self):
         self.printer_initializing(_("Klipper is attempting to start"))
@@ -956,8 +969,8 @@ class KlipperScreen(Gtk.ApplicationWindow):
         home = self._cur_panels[0]
         self.panels_reinit = list(self.panels)
         self._remove_all_panels()
-        if home == "main_menu":
-            self.show_panel(home, items=self._config.get_menu_items("__main"))
+        if home in ("main_menu", "bench"):
+            self.show_home_panel(remove_all=False)
         else:
             self.show_panel(home)
 

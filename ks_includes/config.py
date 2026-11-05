@@ -206,6 +206,8 @@ class KlipperScreenConfig:
                     "start_locked",
                     "keyboard_navigation",
                     "enable_addons",
+                    "bench_layout",
+                    "bench_force_graph",
                 )
                 strs = (
                     "default_printer",
@@ -589,6 +591,28 @@ class KlipperScreenConfig:
                         "developers. Takes effect after a restart."
                     ),
                     "value": "False",
+                }
+            },
+            {
+                "bench_layout": {
+                    "category": _("Appearance"),
+                    "section": "main",
+                    "name": _("Test bench layout"),
+                    "type": "binary",
+                    "tooltip": _("Home screen shows the test bench dashboard instead of the menu"),
+                    "value": "False",
+                    "callback": screen.reload_panels,
+                }
+            },
+            {
+                "bench_force_graph": {
+                    "category": _("Appearance"),
+                    "section": "main",
+                    "name": _("Test bench: nozzle force graph"),
+                    "type": "binary",
+                    "tooltip": _("Third graph on the test bench dashboard (load cell)"),
+                    "value": "True",
+                    "callback": screen.reload_panels,
                 }
             },
             # {"": {"section": "main", "name": _(""), "type": ""}}
