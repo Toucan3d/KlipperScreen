@@ -916,7 +916,11 @@ class Panel(ScreenPanel):
             text = f'<span color="{FORCE_COLOR}">{fmt(force, 0)}</span>'
             if self.eddy is not None:
                 khz = self.buffers["eddy"][-1] if self.buffers["eddy"] else None
-                text += f'  <span color="{EDDY_COLOR}">{fmt(khz, 3)}</span>'
+                if khz is None:
+                    # Only the testbench recorder reads the PCB, during 'bench.py watch'
+                    text += '  <span color="#6B7480">eddy: not recording</span>'
+                else:
+                    text += f'  <span color="{EDDY_COLOR}">{fmt(khz, 3)}</span>'
             self.labels["cur_force"].set_markup(text)
 
         self._refresh_print()
