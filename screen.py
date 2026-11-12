@@ -905,12 +905,22 @@ class KlipperScreen(Gtk.ApplicationWindow):
 
     def state_paused(self):
         self.state_printing()
+        if self.bench_layout():
+            return
         if self._config.get_main_config().getboolean("auto_open_extrude", fallback=True):
             self.show_panel("extrude")
 
     def state_printing(self):
         self.base_panel.close_update_dialog(force=True)
+        if self.bench_layout():
+            # The bench dashboard shows the print status itself
+            if self._cur_panels != ["bench"]:
+                self.show_panel("bench", remove_all=True)
+            return
         self.show_panel("job_status", remove_all=True)
+
+    def bench_layout(self):
+        return self._config.get_main_config().getboolean("bench_layout", False)
 
     def state_ready(self, wait=True):
         # Do not return to main menu if completing a job, timeouts/user input will return
@@ -926,7 +936,7 @@ class KlipperScreen(Gtk.ApplicationWindow):
 
     def show_home_panel(self, remove_all=True):
         """Show the stock main menu, or the test bench dashboard when enabled."""
-        if self._config.get_main_config().getboolean("bench_layout", False):
+        if self.bench_layout():
             self.show_panel("bench", remove_all=remove_all)
         else:
             self.show_panel(

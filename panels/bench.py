@@ -5,8 +5,12 @@ Home screen for a Klipper test bench instead of a printer. Enabled by the
 stays reachable from the "Menu" button.
 
 Left: equal-height live graphs (flow, temperatures, optional nozzle force).
-Right: data grid, console, favorite buttons (macros FAV_1..FAV_7, defined
-and labelled in the Klipper config), flow monitor buttons and fan sliders.
+Right: data grid, print status (only while printing), console, favorite
+buttons (macros FAV_1..FAV_7, defined and labelled in the Klipper config),
+flow monitor buttons and fan sliders.
+
+Every label ellipsizes, so long sensor names never widen the columns past
+the screen.
 """
 
 import logging
@@ -74,6 +78,7 @@ button.bench_btn:active {{ background-color: #3a4553; }}
 button.bench_go {{ background-color: #0F6E56; border-color: #1D9E75; }}
 button.bench_stop {{ background-color: #791F1F; border-color: #A32D2D; }}
 button.bench_unset {{ color: #6b7480; }}
+.bench_print {{ background-color: #1a2028; border-radius: 6px; padding: 0 4px; }}
 .bench_fan {{ background-color: #1a2028; border-radius: 6px; padding: 0 6px; }}
 .bench_fan scale {{ padding: 0; margin: 0 4px; min-height: 0; }}
 .bench_fan scale trough {{ min-height: 6px; padding: 0; margin: 0; border-radius: 3px; }}
@@ -214,10 +219,12 @@ class Panel(ScreenPanel):
 
     def _label(self, text="", xalign=0.0, css=None, chars=None):
         label = Gtk.Label(label=text, xalign=xalign)
+        # Ellipsize every label: its minimum width then no longer depends on
+        # the text, so the layout always fits the screen.
+        label.set_ellipsize(Pango.EllipsizeMode.END)
         if chars:
             label.set_width_chars(chars)
             label.set_max_width_chars(chars)
-            label.set_ellipsize(Pango.EllipsizeMode.END)
         if css:
             label.get_style_context().add_class(css)
         return label
@@ -244,6 +251,7 @@ class Panel(ScreenPanel):
         value = self._label(xalign=1.0, css="bench_mono")
         header.pack_start(name, False, False, 6)
         header.pack_end(value, False, False, 6)
+        self.labels[f"title_{key}"] = name
         self.labels[f"cur_{key}"] = value
 
         events = Gtk.EventBox()
@@ -268,13 +276,13 @@ class Panel(ScreenPanel):
         self.graphs.append(flow)
 
         temp = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=False, min_span=2)
-        names = []
+        self.temp_colors = {}
         for i, name in enumerate(self.temps):
             color = TEMP_COLORS[i % len(TEMP_COLORS)]
             temp.add_series(self.buffers[name], color)
-            names.append(f'<span color="{color}">{self._short(name)}</span>')
-        title = "Temperature [°C]  " + " · ".join(names)
-        box.add(self._graph_box(title, "#C9CCD1", temp, "temp"))
+            self.temp_colors[name] = color
+        # The title carries every sensor with its current value (see _refresh)
+        box.add(self._graph_box("Temperature [°C]", "#C9CCD1", temp, "temp"))
         self.graphs.append(temp)
 
         if self.show_force:
@@ -302,6 +310,7 @@ class Panel(ScreenPanel):
         fixed = [self._build_favorites(), self._build_monitor_buttons()]
         fixed += [self._build_fan(fan) for fan in self.fans]
         box.pack_start(self._build_data(), False, False, 0)
+        box.pack_start(self._build_print(), False, False, 0)
         box.pack_start(self._build_console(), True, True, 0)
         for widget in fixed:
             # Buttons expand inside their row; the row itself must not take
@@ -339,8 +348,37 @@ class Panel(ScreenPanel):
                 grid.attach(value, col * 2 + 1, row, 1, 1)
         return grid
 
+    def _build_print(self):
+        """Print status row, shown only while a print is running or paused."""
+        info = self._label(css="bench_mono")
+        info.set_hexpand(True)
+        self.labels["print_info"] = info
+        pause = self._button(_("Pause"), self._pause_resume)
+        cancel = self._button(_("Cancel"), self._cancel_print, css="bench_stop")
+        self.labels["print_pause"] = pause.get_child()
+        self.labels["print_cancel"] = cancel.get_child()
+        self.cancel_armed = None
+
+        box = Gtk.Box(spacing=4)
+        box.get_style_context().add_class("bench_print")
+        box.set_size_request(-1, round(self.base_px * 2.4))
+        box.pack_start(info, True, True, 4)
+        for button in (pause, cancel):
+            button.set_hexpand(False)
+            button.set_vexpand(False)
+            button.set_size_request(round(self.base_px * 5), -1)
+            box.pack_start(button, False, False, 0)
+        # Hidden until a print starts; content.show_all() must not show it.
+        # Show the children now, the row itself is toggled with show()/hide().
+        for child in box.get_children():
+            child.show_all()
+        box.set_no_show_all(True)
+        self.print_box = box
+        return box
+
     def _build_console(self):
         entry = Gtk.Entry(hexpand=True, placeholder_text=_("Send code…"))
+        entry.set_width_chars(4)
         entry.connect("button-press-event", self._screen.show_keyboard)
         entry.connect("touch-event", self._screen.show_keyboard)
         entry.connect("activate", self._send_command)
@@ -406,7 +444,7 @@ class Panel(ScreenPanel):
 
         box = Gtk.Box(spacing=4)
         box.get_style_context().add_class("bench_fan")
-        box.set_size_request(-1, round(self.base_px * 2.6))
+        box.set_size_request(-1, round(self.base_px * 2.2))
         box.pack_start(name, False, False, 0)
         box.pack_start(scale, True, True, 0)
         box.pack_start(value, False, False, 0)
@@ -460,6 +498,48 @@ class Panel(ScreenPanel):
             )
             return
         self._gcode(key.split(" ", 1)[1].upper())
+
+    def _pause_resume(self, widget):
+        state = self._printer.get_stat("print_stats", "state")
+        self._gcode("RESUME" if state == "paused" else "PAUSE")
+
+    def _cancel_print(self, widget):
+        # Two taps within 3 s: the first one only arms the button
+        if self.cancel_armed is None:
+            self.labels["print_cancel"].set_text(_("Sure?"))
+            self.cancel_armed = GLib.timeout_add_seconds(3, self._disarm_cancel)
+            return
+        GLib.source_remove(self.cancel_armed)
+        self._disarm_cancel()
+        self._gcode("CANCEL_PRINT")
+
+    def _disarm_cancel(self):
+        self.cancel_armed = None
+        self.labels["print_cancel"].set_text(_("Cancel"))
+        return False
+
+    def _refresh_print(self):
+        stats = self._printer.data.get("print_stats", {})
+        state = stats.get("state", "standby")
+        if state not in ("printing", "paused"):
+            if self.print_box.get_visible():
+                self.print_box.hide()
+            return
+        progress = self._printer.get_stat("virtual_sdcard", "progress") or 0
+        name = (stats.get("filename") or "").rsplit("/", 1)[-1]
+        elapsed = int(stats.get("print_duration") or 0)
+        eta = ""
+        if progress > 0.01:
+            left = int(elapsed / progress - elapsed)
+            eta = f" · rest {left // 3600}:{left % 3600 // 60:02d} h"
+        mark = '<span color="#FAC775">❚❚</span>' if state == "paused" else             '<span color="#5DCAA5">▶</span>'
+        self.labels["print_info"].set_markup(
+            f"{mark} <b>{progress * 100:.0f}%</b>  {elapsed // 3600}:{elapsed % 3600 // 60:02d} h"
+            f"{eta}  {GLib.markup_escape_text(name)}"
+        )
+        self.labels["print_pause"].set_text(_("Resume") if state == "paused" else _("Pause"))
+        if not self.print_box.get_visible():
+            self.print_box.show()
 
     def _open_menu(self, widget):
         self._screen.show_panel("main_menu", _("Menu"), items=self._config.get_menu_items("__main"))
@@ -606,11 +686,16 @@ class Panel(ScreenPanel):
         set_("d_ratio", fmt(ratio, 3))
 
         self.labels["cur_flow"].set_text(fmt(enc.get("flow"), 2))
-        self.labels["cur_temp"].set_text(
-            " · ".join(fmt(self._stat(n, "temperature"), 1) for n in self.temps)
-        )
+        parts = [
+            f'<span color="{color}">{GLib.markup_escape_text(self._short(name))}</span> '
+            f'{fmt(self._stat(name, "temperature"), 1)}'
+            for name, color in self.temp_colors.items()
+        ]
+        self.labels["title_temp"].set_markup('<span color="#C9CCD1">°C</span>  ' + "  ".join(parts))
         if "cur_force" in self.labels:
             self.labels["cur_force"].set_text(fmt(force, 0))
+
+        self._refresh_print()
 
         for fan, widgets in self.devices.items():
             speed = self._printer.get_fan_speed(fan)

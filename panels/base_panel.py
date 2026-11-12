@@ -70,6 +70,12 @@ class BasePanel(ScreenPanel):
         self.shortcut["icon"] = self._get_shortcut_icon(self.shortcut["panel"])
         self.control["shortcut"] = self._gtk.Button(self.shortcut["icon"], scale=self.abscale)
         self.control["shortcut"].connect("clicked", self._shortcut_clicked, self.shortcut)
+        # Test bench layout: direct access to the KlipperScreen settings
+        self.control["settings"] = self._gtk.Button("settings", scale=self.abscale)
+        self.control["settings"].connect(
+            "clicked", lambda *a: self._screen.show_panel("settings", _("Settings"))
+        )
+        self.control["settings"].set_no_show_all(True)
 
         # Any action bar button should close the keyboard
         for item in self.control:
@@ -82,6 +88,7 @@ class BasePanel(ScreenPanel):
         self.action_bar.add(self.control["home"])
         self.action_bar.add(self.control["printer_select"])
         self.action_bar.add(self.control["shortcut"])
+        self.action_bar.add(self.control["settings"])
         self.action_bar.add(self.control["estop"])
         self.action_bar.add(self.control["shutdown"])
         self.show_printer_select(len(self._config.get_printers()) > 1)
@@ -367,6 +374,9 @@ class BasePanel(ScreenPanel):
         printing, connected, printer_select = self.get_printer_state()
         self.control["estop"].set_visible(printing)
         self.control["shutdown"].set_visible(not printing)
+        self.control["settings"].set_visible(
+            self._config.get_main_config().getboolean("bench_layout", False)
+        )
         self.show_shortcut(self.shortcut["panel"])
         self.show_printer_select(len(self._config.get_printers()) > 1)
         for control in ("back", "home"):
