@@ -7,7 +7,8 @@ stays reachable from the "Menu" button.
 Left: equal-height live graphs (flow, temperatures, optional nozzle force).
 Right: data grid, print status (only while printing), console, favorite
 buttons (macros FAV_1..FAV_7, defined and labelled in the Klipper config),
-flow monitor buttons and fan sliders.
+flow monitor buttons, nozzle buttons (extrude, retract, heat) and fan
+sliders.
 
 Every label ellipsizes, so long sensor names never widen the columns past
 the screen.
@@ -32,6 +33,7 @@ WINDOWS = (30, 120, 600)
 FAV_COUNT = 7
 CONSOLE_LINES = 200
 FLOW_COLOR = "#5DCAA5"
+FLOW_SET_COLOR = "#C9CCD1"  # expected flow from the extruder move, dashed
 FORCE_COLOR = "#97C459"
 TEMP_COLORS = ("#ED93B1", "#AFA9EC", "#FAC775", "#85B7EB", "#F0997B")
 CONSOLE_COLORS = {
@@ -41,6 +43,14 @@ CONSOLE_COLORS = {
     "info": "#8A929C",
     "time": "#6B7480",
 }
+# Nozzle buttons; each can be overridden in KlipperScreen.conf [main]
+NOZZLE_DEFAULTS = {
+    "bench_extrude_mm": 50.0,       # length of one extrude / retract
+    "bench_extrude_speed": 2.0,     # mm/s
+    "bench_heat_temp": 250.0,       # target of the heat button
+    "bench_heat_timeout": 10.0,     # minutes until the heat button switches off again
+}
+MOVE_STEP_MM = 5.0  # moves are sent in steps so Stop takes effect quickly
 TEMP_REPORT = re.compile(r"^(?:ok\s+)?(B|C|T\d*):")
 
 # Stock Klipper sensor types that measure a real temperature (lower case).
@@ -76,6 +86,7 @@ button.bench_btn {{ background-color: #262e38; border: 1px solid #3a4553; border
 button.bench_btn label {{ font-size: {base}px; }}
 button.bench_btn:active {{ background-color: #3a4553; }}
 button.bench_go {{ background-color: #0F6E56; border-color: #1D9E75; }}
+button.bench_heat {{ background-color: #854F0B; border-color: #BA7517; }}
 button.bench_stop {{ background-color: #791F1F; border-color: #A32D2D; }}
 button.bench_unset {{ color: #6b7480; }}
 .bench_print {{ background-color: #1a2028; border-radius: 6px; padding: 0 4px; }}
@@ -105,10 +116,10 @@ class Panel(ScreenPanel):
         title = title or _("Bench")
         # KlipperScreen reinitializes panels by calling __init__ again on the
         # same object, so stop the timers of the previous run first.
-        for attr in ("sample_timer", "draw_timer"):
+        for attr in ("sample_timer", "draw_timer", "move_timer"):
             if getattr(self, attr, None) is not None:
                 GLib.source_remove(getattr(self, attr))
-        self.sample_timer = self.draw_timer = None
+        self.sample_timer = self.draw_timer = self.move_timer = None
         super().__init__(screen, title)
         fs = self._gtk.font_size
         self.base_px = max(11, round(fs * 0.66))
@@ -126,9 +137,20 @@ class Panel(ScreenPanel):
         ]
         sensors = self._printer.get_filament_sensors()
         self.runout = sensors[0] if sensors else None
+        tools = [t for t in self._printer.get_tools() if t.startswith("extruder")]
+        self.extruder = tools[0] if tools else None
+        cfg = (self._printer.get_config_section(self.extruder) or {}) if self.extruder else {}
+        self.min_extrude_temp = float(cfg.get("min_extrude_temp", 170))
+        diameter = float(cfg.get("filament_diameter", 1.75))
+        self.filament_area = 3.14159265 * diameter * diameter / 4
+        main = self._config.get_main_config()
+        self.nozzle = {k: main.getfloat(k, fallback=v) for k, v in NOZZLE_DEFAULTS.items()}
+        self.move = None
+        self.heat_since = None
 
         size = max(WINDOWS) * SAMPLE_HZ
-        self.buffers = {"flow": deque(maxlen=size), "force": deque(maxlen=size)}
+        self.buffers = {"flow": deque(maxlen=size), "flow_set": deque(maxlen=size),
+                        "force": deque(maxlen=size)}
         for name in self.temps:
             self.buffers[name] = deque(maxlen=size)
         self.window_index = 1
@@ -269,10 +291,13 @@ class Panel(ScreenPanel):
         self.graphs = []
 
         flow = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=True, min_span=5)
+        flow.add_series(self.buffers["flow_set"], FLOW_SET_COLOR, dashed=True)
         flow.add_series(self.buffers["flow"], FLOW_COLOR)
         if not self.encoder:
             flow.message = _("No filament_encoder configured")
-        box.add(self._graph_box("Flow [mm³/s]", FLOW_COLOR, flow, "flow"))
+        box.add(self._graph_box(
+            f'Flow [mm³/s]  real  <span color="{FLOW_SET_COLOR}">- - set</span>',
+            FLOW_COLOR, flow, "flow"))
         self.graphs.append(flow)
 
         temp = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=False, min_span=2)
@@ -307,7 +332,8 @@ class Panel(ScreenPanel):
 
     def _build_right(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        fixed = [self._build_favorites(), self._build_monitor_buttons()]
+        fixed = [self._build_favorites(), self._build_monitor_buttons(),
+                 self._build_nozzle_buttons()]
         fixed += [self._build_fan(fan) for fan in self.fans]
         box.pack_start(self._build_data(), False, False, 0)
         box.pack_start(self._build_print(), False, False, 0)
@@ -421,6 +447,18 @@ class Panel(ScreenPanel):
         grid.attach(menu, 3, 1, 1, 1)
         self._update_favorite_labels()
         return grid
+
+    def _build_nozzle_buttons(self):
+        box = Gtk.Box(spacing=4, homogeneous=True)
+        box.set_size_request(-1, round(self.base_px * 2.9))
+        self.nozzle_buttons = {
+            "extrude": self._button("", self._move_clicked, 1),
+            "retract": self._button("", self._move_clicked, -1),
+            "heat": self._button("", self._heat_clicked),
+        }
+        for button in self.nozzle_buttons.values():
+            box.add(button)
+        return box
 
     def _build_monitor_buttons(self):
         box = Gtk.Box(spacing=4, homogeneous=True)
@@ -541,6 +579,149 @@ class Panel(ScreenPanel):
         if not self.print_box.get_visible():
             self.print_box.show()
 
+    # ---------- nozzle: extrude, retract, heat ----------
+
+    def _nozzle_state(self):
+        printing = self._printer.get_stat("print_stats", "state") in ("printing", "paused")
+        temp = self._stat(self.extruder, "temperature") or 0.0
+        target = self._stat(self.extruder, "target") or 0.0
+        return printing, temp, target
+
+    def _move_clicked(self, widget, direction):
+        if self.move is not None:
+            self._stop_move("Stopped")
+            return
+        printing, temp, _target = self._nozzle_state()
+        if not self.extruder:
+            self._add_console_line("error", time.time(), "!! No extruder configured")
+        elif printing:
+            self._add_console_line("info", time.time(), "Not while a print/test is running")
+        elif temp < self.min_extrude_temp:
+            self._add_console_line(
+                "info", time.time(),
+                f"Nozzle too cold: {temp:.0f} °C, needs {self.min_extrude_temp:.0f} °C")
+        else:
+            length, speed = self.nozzle["bench_extrude_mm"], self.nozzle["bench_extrude_speed"]
+            word = "Extrude" if direction > 0 else "Retract"
+            self._add_console_line(
+                "command", time.time(), f"{word} {length:g} mm at {speed:g} mm/s")
+            self.move = {"dir": direction, "done": 0.0, "total": length}
+            self._move_step()
+            self.move_timer = GLib.timeout_add(int(MOVE_STEP_MM / speed * 1000), self._move_step)
+        self._refresh_nozzle()
+
+    def _move_step(self):
+        move = self.move
+        if move is None:
+            return False
+        printing, temp, _target = self._nozzle_state()
+        if printing or temp < self.min_extrude_temp:
+            self._stop_move("Stopped (print started or nozzle too cold)")
+            return False
+        if move["done"] >= move["total"] - 1e-6:
+            # The last step was sent one interval ago and has finished by now
+            self._add_console_line("info", time.time(), f"Done: {move['done']:g} mm")
+            self.move = None
+            self.move_timer = None
+            self._refresh_nozzle()
+            return False
+        step = min(MOVE_STEP_MM, move["total"] - move["done"])
+        feed = self.nozzle["bench_extrude_speed"] * 60
+        # Relative E only for this move; the gcode state of running tests stays as it was
+        self._screen._ws.api.gcode_script(
+            "SAVE_GCODE_STATE NAME=bench_move\nM83\n"
+            f"G1 E{move['dir'] * step:.3f} F{feed:.0f}\n"
+            "RESTORE_GCODE_STATE NAME=bench_move"
+        )
+        move["done"] += step
+        self._refresh_nozzle()
+        return True
+
+    def _stop_move(self, reason):
+        if self.move_timer is not None:
+            GLib.source_remove(self.move_timer)
+            self.move_timer = None
+        if self.move is not None:
+            self._add_console_line(
+                "info", time.time(),
+                f"{reason} after {self.move['done']:g} mm "
+                f"(the current {MOVE_STEP_MM:g} mm step finishes)")
+        self.move = None
+        self._refresh_nozzle()
+
+    def _heat_clicked(self, widget):
+        printing, _temp, target = self._nozzle_state()
+        if not self.extruder:
+            self._add_console_line("error", time.time(), "!! No extruder configured")
+            return
+        if printing:
+            self._add_console_line("info", time.time(), "Not while a print/test is running")
+            return
+        if target > 0:
+            self._set_nozzle_target(0)
+        else:
+            self._set_nozzle_target(self.nozzle["bench_heat_temp"])
+            self.heat_since = time.time()
+        self._refresh_nozzle()
+
+    def _set_nozzle_target(self, target):
+        if target <= 0:
+            self.heat_since = None
+        self._gcode(f"SET_HEATER_TEMPERATURE HEATER={self.extruder} TARGET={target:.0f}")
+
+    def _heat_left(self):
+        return self.nozzle["bench_heat_timeout"] * 60 - (time.time() - self.heat_since)
+
+    def _refresh_nozzle(self):
+        if not hasattr(self, "nozzle_buttons"):
+            return
+        printing, temp, target = self._nozzle_state()
+        length = self.nozzle["bench_extrude_mm"]
+        if target <= 0:
+            self.heat_since = None
+        elif self.heat_since and not printing and self._heat_left() <= 0:
+            self._add_console_line("info", time.time(), "Heat button: timeout, nozzle off")
+            self._set_nozzle_target(0)
+            target = 0
+
+        for key, direction, word in (("extrude", 1, "Extrude"), ("retract", -1, "Retract")):
+            button = self.nozzle_buttons[key]
+            ctx = button.get_style_context()
+            active = self.move is not None and self.move["dir"] == direction
+            if active:
+                title, sub = "Stop", f"{self.move['done']:g} / {length:g} mm"
+            else:
+                title = f"{word} {length:g} mm"
+                if printing:
+                    sub = "printing"
+                elif temp < self.min_extrude_temp:
+                    sub = f"needs ≥{self.min_extrude_temp:.0f} °C"
+                else:
+                    sub = f"{self.nozzle['bench_extrude_speed']:g} mm/s"
+            usable = active or (self.move is None and not printing
+                                and temp >= self.min_extrude_temp)
+            (ctx.add_class if active else ctx.remove_class)("bench_stop")
+            (ctx.remove_class if usable else ctx.add_class)("bench_unset")
+            button.get_child().set_markup(f'<b>{title}</b>\n<span size="small">{sub}</span>')
+
+        button = self.nozzle_buttons["heat"]
+        ctx = button.get_style_context()
+        if target > 0:
+            title, sub = "Heater off", f"{temp:.0f} → {target:.0f} °C"
+            if self.heat_since and not printing:
+                sub += f" · {max(0.0, self._heat_left()) / 60:.0f} min"
+            ctx.add_class("bench_stop")
+            ctx.remove_class("bench_heat")
+        else:
+            title = f"Heat {self.nozzle['bench_heat_temp']:.0f} °C"
+            sub = f"nozzle {temp:.0f} °C"
+            ctx.add_class("bench_heat")
+            ctx.remove_class("bench_stop")
+        (ctx.add_class if printing else ctx.remove_class)("bench_unset")
+        if printing:
+            sub = "printing"
+        button.get_child().set_markup(f'<b>{title}</b>\n<span size="small">{sub}</span>')
+
     def _open_menu(self, widget):
         self._screen.show_panel("main_menu", _("Menu"), items=self._config.get_menu_items("__main"))
 
@@ -627,12 +808,20 @@ class Panel(ScreenPanel):
                 return data[field]
         return None
 
+    def _flow_set(self):
+        """Expected flow: live extruder velocity times the filament cross-section."""
+        velocity = self._stat("motion_report", "live_extruder_velocity")
+        if velocity is None or not self.extruder:
+            return None
+        return velocity * self.filament_area
+
     def _sample(self):
         # Moonraker's temperature store arrives shortly after the panel is built
         if not self.prefilled and self._printer.tempstore:
             self.prefilled = True
             self._prefill_from_tempstore()
         self.buffers["flow"].append(self._stat(self.encoder, "flow"))
+        self.buffers["flow_set"].append(self._flow_set())
         self.buffers["force"].append(self._force())
         for name in self.temps:
             self.buffers[name].append(self._stat(name, "temperature"))
@@ -685,7 +874,10 @@ class Panel(ScreenPanel):
         ratio = mon.get("ratio") if running else last.get("ratio")
         set_("d_ratio", fmt(ratio, 3))
 
-        self.labels["cur_flow"].set_text(fmt(enc.get("flow"), 2))
+        self.labels["cur_flow"].set_markup(
+            f'<span color="{FLOW_COLOR}">{fmt(enc.get("flow"), 2)}</span>  '
+            f'<span color="{FLOW_SET_COLOR}">set {fmt(self._flow_set(), 2)}</span>'
+        )
         parts = [
             f'<span color="{color}">{GLib.markup_escape_text(self._short(name))}</span> '
             f'{fmt(self._stat(name, "temperature"), 1)}'
@@ -696,6 +888,7 @@ class Panel(ScreenPanel):
             self.labels["cur_force"].set_text(fmt(force, 0))
 
         self._refresh_print()
+        self._refresh_nozzle()
 
         for fan, widgets in self.devices.items():
             speed = self._printer.get_fan_speed(fan)

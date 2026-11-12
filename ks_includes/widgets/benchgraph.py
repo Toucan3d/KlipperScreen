@@ -40,12 +40,12 @@ class BenchGraph(Gtk.DrawingArea):
         self.min_span = min_span
         self.decimals = decimals
         self.window_s = 120
-        self.series = []  # (buffer, rgb)
+        self.series = []  # (buffer, rgb, dashed)
         self.message = None
         self.connect("draw", self.on_draw)
 
-    def add_series(self, buffer, color):
-        self.series.append((buffer, hex_to_rgb(color)))
+    def add_series(self, buffer, color, dashed=False):
+        self.series.append((buffer, hex_to_rgb(color), dashed))
 
     def set_window(self, seconds):
         self.window_s = seconds
@@ -65,8 +65,8 @@ class BenchGraph(Gtk.DrawingArea):
         if plot_h < 10 or right - left < 10:
             return
 
-        visible = [(self._visible(buf), rgb) for buf, rgb in self.series]
-        values = [y for data, _ in visible for y in data if y is not None]
+        visible = [(self._visible(buf), rgb, dashed) for buf, rgb, dashed in self.series]
+        values = [y for data, _, _ in visible for y in data if y is not None]
         if values:
             lo, hi = min(values), max(values)
         else:
@@ -133,10 +133,11 @@ class BenchGraph(Gtk.DrawingArea):
         ctx.rectangle(left, top, right - left, plot_h)
         ctx.clip()
         ctx.set_line_width(max(1.5, fs / 8))
-        for data, rgb in visible:
+        for data, rgb, dashed in visible:
             if not data:
                 continue
             ctx.set_source_rgb(*rgb)
+            ctx.set_dash([fs * 0.6, fs * 0.4] if dashed else [])
             offset = count - len(data)
             pixels = right - left
             if len(data) > pixels * 2:
