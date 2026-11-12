@@ -225,6 +225,7 @@ class KlipperScreenConfig:
                     "side_shortcut_target",
                     "shutdown_action",
                     "reboot_action",
+                    "bench_eddy_glob",
                 )
                 numbers = (
                     "job_complete_timeout",
@@ -236,6 +237,10 @@ class KlipperScreenConfig:
                     "height",
                     "autolock_timeout",
                     "screensaver_wake_delay",
+                    "bench_extrude_mm",
+                    "bench_extrude_speed",
+                    "bench_heat_temp",
+                    "bench_heat_timeout",
                 )
             elif section.startswith("printer "):
                 bools = (

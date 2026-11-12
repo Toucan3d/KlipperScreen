@@ -4,7 +4,8 @@ Home screen for a Klipper test bench instead of a printer. Enabled by the
 "Test bench layout" option in the KlipperScreen settings; the stock main menu
 stays reachable from the "Menu" button.
 
-Left: equal-height live graphs (flow, temperatures, optional nozzle force).
+Left: equal-height live graphs (flow, temperatures, optional nozzle force
+with the eddy-current sensor on its own right axis).
 Right: data grid, print status (only while printing), console, favorite
 buttons (macros FAV_1..FAV_7, defined and labelled in the Klipper config),
 flow monitor buttons, nozzle buttons (extrude, retract, heat) and fan
@@ -25,6 +26,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
+from ks_includes.bench_eddy import EddyTail
 from ks_includes.screen_panel import ScreenPanel
 from ks_includes.widgets.benchgraph import BenchGraph
 
@@ -35,6 +37,10 @@ CONSOLE_LINES = 200
 FLOW_COLOR = "#5DCAA5"
 FLOW_SET_COLOR = "#C9CCD1"  # expected flow from the extruder move, dashed
 FORCE_COLOR = "#97C459"
+EDDY_COLOR = "#85B7EB"
+# Live CSVs of the testbench eddy recorder; option bench_eddy_glob, comma separated, empty = off
+EDDY_GLOB = "~/testbench/runs/*/logs/eddy*.csv"
+EDDY_MIN_SPAN_KHZ = 0.02  # the sensor noise (a few Hz) does not fill the axis
 TEMP_COLORS = ("#ED93B1", "#AFA9EC", "#FAC775", "#85B7EB", "#F0997B")
 CONSOLE_COLORS = {
     "command": "#85B7EB",
@@ -147,10 +153,14 @@ class Panel(ScreenPanel):
         self.nozzle = {k: main.getfloat(k, fallback=v) for k, v in NOZZLE_DEFAULTS.items()}
         self.move = None
         self.heat_since = None
+        # Eddy-current force sensor: not a Klipper object, followed in the recorder's CSV
+        pattern = main.get("bench_eddy_glob", fallback=EDDY_GLOB)
+        self.eddy = EddyTail(pattern) if self.show_force and pattern.strip() else None
+        self.eddy_failed = False
 
         size = max(WINDOWS) * SAMPLE_HZ
         self.buffers = {"flow": deque(maxlen=size), "flow_set": deque(maxlen=size),
-                        "force": deque(maxlen=size)}
+                        "force": deque(maxlen=size), "eddy": deque(maxlen=size)}
         for name in self.temps:
             self.buffers[name] = deque(maxlen=size)
         self.window_index = 1
@@ -316,7 +326,12 @@ class Panel(ScreenPanel):
             self.force_graph = force
             if not self.load_cell:
                 force.message = _("No load cell configured")
-            box.add(self._graph_box("Nozzle force [g]", FORCE_COLOR, force, "force"))
+            title = "Nozzle force [g]"
+            if self.eddy is not None:
+                force.set_right_axis(EDDY_COLOR, zero_based=False, min_span=EDDY_MIN_SPAN_KHZ)
+                force.add_series(self.buffers["eddy"], EDDY_COLOR, right=True)
+                title += f'  <span color="{EDDY_COLOR}">eddy [kHz]</span>'
+            box.add(self._graph_box(title, FORCE_COLOR, force, "force"))
             self.graphs.append(force)
 
         for graph in self.graphs:
@@ -815,6 +830,18 @@ class Panel(ScreenPanel):
             return None
         return velocity * self.filament_area
 
+    def _eddy_khz(self):
+        if self.eddy is None or self.eddy_failed:
+            return None
+        try:
+            hz = self.eddy.poll()
+        except Exception as e:
+            # Keep the sample timer alive; the eddy line just stays empty
+            logging.exception(f"bench eddy failed, switched off until restart: {e}")
+            self.eddy_failed = True
+            return None
+        return None if hz is None else hz / 1000
+
     def _sample(self):
         # Moonraker's temperature store arrives shortly after the panel is built
         if not self.prefilled and self._printer.tempstore:
@@ -823,6 +850,7 @@ class Panel(ScreenPanel):
         self.buffers["flow"].append(self._stat(self.encoder, "flow"))
         self.buffers["flow_set"].append(self._flow_set())
         self.buffers["force"].append(self._force())
+        self.buffers["eddy"].append(self._eddy_khz())
         for name in self.temps:
             self.buffers[name].append(self._stat(name, "temperature"))
         return True
@@ -885,7 +913,11 @@ class Panel(ScreenPanel):
         ]
         self.labels["title_temp"].set_markup('<span color="#C9CCD1">°C</span>  ' + "  ".join(parts))
         if "cur_force" in self.labels:
-            self.labels["cur_force"].set_text(fmt(force, 0))
+            text = f'<span color="{FORCE_COLOR}">{fmt(force, 0)}</span>'
+            if self.eddy is not None:
+                khz = self.buffers["eddy"][-1] if self.buffers["eddy"] else None
+                text += f'  <span color="{EDDY_COLOR}">{fmt(khz, 3)}</span>'
+            self.labels["cur_force"].set_markup(text)
 
         self._refresh_print()
         self._refresh_nozzle()

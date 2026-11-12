@@ -1,8 +1,9 @@
 """Compact strip chart for the test bench panel.
 
-Each graph owns its own Y axis with round tick steps. Series are fixed-rate
-ring buffers filled by the panel; the graph only draws the newest samples
-that fit the selected time window.
+Each graph owns its own Y axis with round tick steps; series of another unit
+can go on a second axis on the right. Series are fixed-rate ring buffers
+filled by the panel; the graph only draws the newest samples that fit the
+selected time window.
 """
 
 import math
@@ -26,9 +27,54 @@ def nice_range(lo, hi, ticks=4):
     return math.floor(lo / step) * step, math.ceil(hi / step) * step, step
 
 
+def step_decimals(step):
+    """Decimals that show every tick of a 1/2/2.5/5 step exactly."""
+    if float(step).is_integer():
+        return 0
+    power = math.floor(math.log10(step) + 1e-9)
+    mantissa = round(step / 10**power, 6)
+    return max(0, -power) + (1 if mantissa == 2.5 else 0)
+
+
 def hex_to_rgb(color):
     color = color.lstrip("#")
     return tuple(int(color[i : i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+class Axis:
+    def __init__(self, zero_based, min_span, decimals=None, rgb=None):
+        self.zero_based = zero_based
+        self.min_span = min_span
+        self.decimals = decimals
+        self.rgb = rgb
+        self.lo, self.hi, self.step = 0.0, 1.0, 1.0
+
+    def fit(self, values):
+        if values:
+            lo, hi = min(values), max(values)
+        else:
+            lo, hi = 0.0, self.min_span
+        if self.zero_based:
+            lo = min(0.0, lo)
+            hi = max(hi * 1.1, lo + self.min_span)
+        else:
+            mid = (lo + hi) / 2
+            half = max((hi - lo) / 2 * 1.2, self.min_span / 2)
+            lo, hi = mid - half, mid + half
+        self.lo, self.hi, self.step = nice_range(lo, hi)
+
+    def ticks(self):
+        decimals = self.decimals if self.decimals is not None else step_decimals(self.step)
+        result = []
+        for i in range(round((self.hi - self.lo) / self.step) + 1):
+            value = self.lo + i * self.step
+            if abs(value) < self.step * 1e-6:
+                value = 0.0
+            result.append((value, f"{value:.{decimals}f}"))
+        return result
+
+    def y(self, value, top, bottom):
+        return bottom - (bottom - top) * (value - self.lo) / (self.hi - self.lo)
 
 
 class BenchGraph(Gtk.DrawingArea):
@@ -36,16 +82,19 @@ class BenchGraph(Gtk.DrawingArea):
         super().__init__(hexpand=True, vexpand=True)
         self.sample_rate = sample_rate
         self.font_px = font_px
-        self.zero_based = zero_based
-        self.min_span = min_span
-        self.decimals = decimals
+        self.axis = Axis(zero_based, min_span, decimals)
+        self.right_axis = None
         self.window_s = 120
-        self.series = []  # (buffer, rgb, dashed)
+        self.series = []  # (buffer, rgb, dashed, on the right axis)
         self.message = None
         self.connect("draw", self.on_draw)
 
-    def add_series(self, buffer, color, dashed=False):
-        self.series.append((buffer, hex_to_rgb(color), dashed))
+    def add_series(self, buffer, color, dashed=False, right=False):
+        self.series.append((buffer, hex_to_rgb(color), dashed, right))
+
+    def set_right_axis(self, color, zero_based=False, min_span=1.0, decimals=None):
+        """Second Y axis for the series added with right=True, drawn while they have data."""
+        self.right_axis = Axis(zero_based, min_span, decimals, hex_to_rgb(color))
 
     def set_window(self, seconds):
         self.window_s = seconds
@@ -60,48 +109,38 @@ class BenchGraph(Gtk.DrawingArea):
         width = self.get_allocated_width()
         height = self.get_allocated_height()
         fs = self.font_px
-        left, right, top, bottom = fs * 3.6, width - fs * 0.6, fs * 0.6, height - fs * 1.4
-        plot_h = bottom - top
-        if plot_h < 10 or right - left < 10:
-            return
-
-        visible = [(self._visible(buf), rgb, dashed) for buf, rgb, dashed in self.series]
-        values = [y for data, _, _ in visible for y in data if y is not None]
-        if values:
-            lo, hi = min(values), max(values)
-        else:
-            lo, hi = 0.0, self.min_span
-        if self.zero_based:
-            lo = min(0.0, lo)
-            hi = max(hi * 1.1, lo + self.min_span)
-        else:
-            mid = (lo + hi) / 2
-            half = max((hi - lo) / 2 * 1.2, self.min_span / 2)
-            lo, hi = mid - half, mid + half
-        lo, hi, step = nice_range(lo, hi)
-        span = hi - lo
-
         ctx.select_font_face("monospace")
         ctx.set_font_size(fs)
         ctx.set_line_width(1)
 
-        # Horizontal gridlines and Y tick labels
-        decimals = self.decimals
-        if decimals is None:
-            decimals = 0 if float(step).is_integer() else (1 if step >= 0.1 else 2)
-        value = lo
-        while value <= hi + step / 2:
-            y = bottom - plot_h * (value - lo) / span
+        visible = [(self._visible(buf), rgb, dashed, r) for buf, rgb, dashed, r in self.series]
+        left_values = [y for data, _, _, r in visible if not r for y in data if y is not None]
+        right_values = [y for data, _, _, r in visible if r for y in data if y is not None]
+        self.axis.fit(left_values)
+        right_axis = self.right_axis if self.right_axis is not None and right_values else None
+        right_ticks = []
+        if right_axis is not None:
+            right_axis.fit(right_values)
+            right_ticks = right_axis.ticks()
+        right_w = max((ctx.text_extents(t).x_advance for _, t in right_ticks), default=0)
+
+        left, top, bottom = fs * 3.6, fs * 0.6, height - fs * 1.4
+        right = width - fs * 0.6 - (right_w + fs * 0.5 if right_axis else 0)
+        plot_h = bottom - top
+        if plot_h < 10 or right - left < 10:
+            return
+
+        # Horizontal gridlines and tick labels of the left axis
+        for value, label in self.axis.ticks():
+            y = self.axis.y(value, top, bottom)
             ctx.set_source_rgb(0.15, 0.18, 0.21)
             ctx.move_to(left, y)
             ctx.line_to(right, y)
             ctx.stroke()
-            label = f"{value:.{decimals}f}"
             ext = ctx.text_extents(label)
             ctx.set_source_rgb(0.54, 0.57, 0.61)
             ctx.move_to(left - ext.width - fs * 0.4, y + ext.height / 2)
             ctx.show_text(label)
-            value += step
 
         # Axes
         ctx.set_source_rgb(0.29, 0.33, 0.38)
@@ -109,6 +148,22 @@ class BenchGraph(Gtk.DrawingArea):
         ctx.line_to(left, bottom)
         ctx.line_to(right, bottom)
         ctx.stroke()
+
+        # Right axis: line, ticks and labels in the color of its series
+        if right_axis is not None:
+            ctx.set_source_rgb(*right_axis.rgb)
+            ctx.move_to(right, top)
+            ctx.line_to(right, bottom)
+            for value, label in right_ticks:
+                y = right_axis.y(value, top, bottom)
+                ctx.move_to(right - fs * 0.3, y)
+                ctx.line_to(right, y)
+            ctx.stroke()
+            for value, label in right_ticks:
+                y = right_axis.y(value, top, bottom)
+                ext = ctx.text_extents(label)
+                ctx.move_to(right + fs * 0.3, y + ext.height / 2)
+                ctx.show_text(label)
 
         # Time labels: -window ... 0 s
         ctx.set_source_rgb(0.42, 0.45, 0.50)
@@ -133,8 +188,11 @@ class BenchGraph(Gtk.DrawingArea):
         ctx.rectangle(left, top, right - left, plot_h)
         ctx.clip()
         ctx.set_line_width(max(1.5, fs / 8))
-        for data, rgb, dashed in visible:
+        for data, rgb, dashed, on_right in visible:
             if not data:
+                continue
+            axis = right_axis if on_right else self.axis
+            if axis is None:
                 continue
             ctx.set_source_rgb(*rgb)
             ctx.set_dash([fs * 0.6, fs * 0.4] if dashed else [])
@@ -152,7 +210,7 @@ class BenchGraph(Gtk.DrawingArea):
                         continue
                     x = left + (offset * x_step) + px * (len(data) * x_step / pixels)
                     for v in (min(chunk), max(chunk)):
-                        y = bottom - plot_h * (v - lo) / span
+                        y = axis.y(v, top, bottom)
                         if started:
                             ctx.line_to(x, y)
                         else:
@@ -165,7 +223,7 @@ class BenchGraph(Gtk.DrawingArea):
                         started = False
                         continue
                     x = left + (offset + i) * x_step
-                    y = bottom - plot_h * (v - lo) / span
+                    y = axis.y(v, top, bottom)
                     if started:
                         ctx.line_to(x, y)
                     else:
