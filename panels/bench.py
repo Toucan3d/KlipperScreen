@@ -38,7 +38,10 @@ FLOW_COLOR = "#5DCAA5"
 FLOW_SET_COLOR = "#C9CCD1"  # expected flow from the extruder move, dashed
 FORCE_COLOR = "#97C459"
 EDDY_COLOR = "#85B7EB"
-# Live CSVs of the testbench eddy recorder; option bench_eddy_glob, comma separated, empty = off
+# Live file of the testbench eddy service (option bench_eddy_live, empty = not used) and,
+# without the service, the live CSVs of the recorder (bench_eddy_glob, comma separated,
+# empty = off)
+EDDY_LIVE = "/dev/shm/eddy_live.json"
 EDDY_GLOB = "~/testbench/runs/*/logs/eddy*.csv"
 EDDY_MIN_SPAN_KHZ = 0.02  # the sensor noise (a few Hz) does not fill the axis
 TEMP_COLORS = ("#ED93B1", "#AFA9EC", "#FAC775", "#85B7EB", "#F0997B")
@@ -155,7 +158,9 @@ class Panel(ScreenPanel):
         self.heat_since = None
         # Eddy-current force sensor: not a Klipper object, followed in the recorder's CSV
         pattern = main.get("bench_eddy_glob", fallback=EDDY_GLOB)
-        self.eddy = EddyTail(pattern) if self.show_force and pattern.strip() else None
+        live = main.get("bench_eddy_live", fallback=EDDY_LIVE)
+        self.eddy = (EddyTail(pattern, live)
+                     if self.show_force and (pattern.strip() or live.strip()) else None)
         self.eddy_failed = False
 
         size = max(WINDOWS) * SAMPLE_HZ
@@ -917,8 +922,9 @@ class Panel(ScreenPanel):
             if self.eddy is not None:
                 khz = self.buffers["eddy"][-1] if self.buffers["eddy"] else None
                 if khz is None:
-                    # Only the testbench recorder reads the PCB, during 'bench.py watch'
-                    text += '  <span color="#6B7480">eddy: not recording</span>'
+                    # Why: no PCB, service off, not recording (see bench_eddy.py)
+                    status = GLib.markup_escape_text(self.eddy.status or "no value")
+                    text += f'  <span color="#6B7480">eddy: {status}</span>'
                 else:
                     text += f'  <span color="{EDDY_COLOR}">{fmt(khz, 3)}</span>'
             self.labels["cur_force"].set_markup(text)

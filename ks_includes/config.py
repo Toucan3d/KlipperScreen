@@ -226,6 +226,7 @@ class KlipperScreenConfig:
                     "shutdown_action",
                     "reboot_action",
                     "bench_eddy_glob",
+                    "bench_eddy_live",
                 )
                 numbers = (
                     "job_complete_timeout",

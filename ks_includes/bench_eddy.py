@@ -1,12 +1,19 @@
 """Live values of the eddy-current force sensor for the test bench panel.
 
-The eddy-current PCB is not a Klipper object. The test bench recorder
-(tools/eddy_record.py in the private testbench repo) reads it while
-'bench.py watch' records a run and writes logs/eddy[_N].csv, flushed about
-every 0.5 s. This module follows the newest of those files and turns the raw
-LDC161x values into Hz with the reference frequency that the recorder logs
-when the stream starts. It never opens the PCB itself, so it cannot disturb a
-recording, and it needs no protocol code.
+The eddy-current PCB is not a Klipper object. Normally the eddy service of
+the private testbench repo (tools/eddy_service.py) owns it all the time and
+writes the mean frequency about every 0.25 s into a small JSON file in RAM
+(option bench_eddy_live, default /dev/shm/eddy_live.json); this module reads
+that file.
+
+Without the service, 'bench.py watch' runs tools/eddy_record.py during a
+run, which writes logs/eddy[_N].csv, flushed about every 0.5 s. Then this
+module follows the newest of those files (option bench_eddy_glob) and turns
+the raw LDC161x values into Hz with the reference frequency that the
+recorder logs when the stream starts.
+
+It never opens the PCB itself, so it cannot disturb a recording, and it
+needs no protocol code.
 """
 
 import glob
@@ -20,11 +27,22 @@ SCAN_S = 5.0  # how often to look for a recording while none is followed
 STALE_S = 3.0  # a file without new rows for this long has ended
 TAIL_BYTES = 4096  # where to start in a file that is opened or fell behind
 MAX_BACKLOG = 256 * 1024  # a longer backlog is skipped, the graph shows live values
+NO_SERVICE = object()
+# Service states as the panel shows them
+STATE_TEXT = {
+    "no_device": "no PCB",
+    "connecting": "connecting",
+    "error": "PCB error",
+    "stopped": "service stopped",
+    "streaming": "no samples",
+}
 
 
 class EddyTail:
-    def __init__(self, patterns):
+    def __init__(self, patterns, live_path=None):
         self.patterns = [os.path.expanduser(p.strip()) for p in patterns.split(",") if p.strip()]
+        self.live_path = os.path.expanduser(live_path.strip()) if live_path and live_path.strip() else None
+        self.status = "not recording"  # why there is no value; None while values come
         self.file = self.path = self.fref = None
         self.raw_col, self.ncols = 2, None
         self.rest = b""
@@ -42,6 +60,34 @@ class EddyTail:
         )
 
     def poll(self):
+        """-> frequency in Hz, or None; then self.status says why."""
+        if self.live_path:
+            hz = self._poll_live()
+            if hz is not NO_SERVICE:
+                return hz
+        hz = self._poll_csv()
+        if hz is not None:
+            self.status = None
+        else:
+            self.status = "service off" if self.live_path else "not recording"
+        return hz
+
+    def _poll_live(self):
+        try:
+            with open(self.live_path, encoding="utf-8") as f:
+                live = json.load(f)
+        except (OSError, ValueError):
+            return NO_SERVICE
+        if not isinstance(live, dict) or time.time() - (live.get("unix_time") or 0) > STALE_S:
+            return NO_SERVICE  # the service is not running
+        hz = live.get("freq_hz")
+        if live.get("state") == "streaming" and isinstance(hz, (int, float)):
+            self.status = None
+            return float(hz)
+        self.status = STATE_TEXT.get(live.get("state"), str(live.get("state")))
+        return None
+
+    def _poll_csv(self):
         """Read the new rows -> frequency in Hz (mean of the newest rows), None without a live recording."""
         now = time.monotonic()
         if self.file is not None and now - self.last_rows > STALE_S:
