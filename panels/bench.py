@@ -44,6 +44,10 @@ EDDY_COLOR = "#85B7EB"
 EDDY_LIVE = "/dev/shm/eddy_live.json"
 EDDY_GLOB = "~/testbench/runs/*/logs/eddy*.csv"
 EDDY_MIN_SPAN_KHZ = 0.02  # the sensor noise (a few Hz) does not fill the axis
+# Angle sensor as length source: about 0.07 deg rms with the magnet in place, tens of
+# degrees without it
+ANGLE_NOISE_BAD = 1.0
+BAD_COLOR = "#F09595"
 TEMP_COLORS = ("#ED93B1", "#AFA9EC", "#FAC775", "#85B7EB", "#F0997B")
 CONSOLE_COLORS = {
     "command": "#85B7EB",
@@ -138,6 +142,9 @@ class Panel(ScreenPanel):
 
         self.encoder = self._first_section("filament_encoder ")
         self.encoder_name = self.encoder.split(" ", 1)[1] if self.encoder else None
+        # Length from an [angle] sensor on the filament wheel instead of SFS edges
+        enc_cfg = (self._printer.get_config_section(self.encoder) or {}) if self.encoder else {}
+        self.angle_source = bool(enc_cfg.get("angle_sensor"))
         self.load_cell = self._first_section("load_cell")
         self.show_force = self._config.get_main_config().getboolean("bench_force_graph", True)
         self.temps = self._temperature_objects()
@@ -329,7 +336,8 @@ class Panel(ScreenPanel):
             force = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=True, min_span=100)
             force.add_series(self.buffers["force"], FORCE_COLOR)
             self.force_graph = force
-            if not self.load_cell:
+            # Without a load cell the eddy line alone still fills the graph
+            if not self.load_cell and self.eddy is None:
                 force.message = _("No load cell configured")
             title = "Nozzle force [g]"
             if self.eddy is not None:
@@ -366,8 +374,12 @@ class Panel(ScreenPanel):
         return box
 
     def _build_data(self):
-        enc = [("abs", "abs"), ("rel", "rel"), ("edges", "edges"), ("mpe", "mm/edge"),
-               ("speed", "speed"), ("flowv", "flow")]
+        if self.angle_source:
+            enc = [("abs", "abs"), ("rel", "rel"), ("turns", "turns"), ("noise", "noise"),
+                   ("speed", "speed"), ("flowv", "flow")]
+        else:
+            enc = [("abs", "abs"), ("rel", "rel"), ("edges", "edges"), ("mpe", "mm/edge"),
+                   ("speed", "speed"), ("flowv", "flow")]
         mon = [("label", "label"), ("elapsed", "elapsed"), ("last", "last"), ("dur", "dur"),
                ("len", "len"), ("qavg", "Q avg/max")]
         sen = [(f"t_{n}", self._short(n)) for n in self.temps[:3]]
@@ -868,8 +880,11 @@ class Panel(ScreenPanel):
 
         set_("d_abs", fmt(enc.get("absolute"), 2, "mm"))
         set_("d_rel", fmt(enc.get("relative"), 2, "mm"))
-        set_("d_edges", fmt(enc.get("relative_edges"), 0))
-        set_("d_mpe", fmt(enc.get("mm_per_edge"), 3))
+        if self.angle_source:
+            self._refresh_angle(enc)
+        else:
+            set_("d_edges", fmt(enc.get("relative_edges"), 0))
+            set_("d_mpe", fmt(enc.get("mm_per_edge"), 3))
         set_("d_speed", fmt(enc.get("speed"), 2, "mm/s"))
         set_("d_flowv", fmt(enc.get("flow"), 2, "mm³/s"))
 
@@ -937,6 +952,22 @@ class Panel(ScreenPanel):
             widgets["value"].set_text(f"{speed * 100:.0f}%")
             if fan not in self.fan_dragging:
                 widgets["scale"].set_value(speed * 100)
+
+    def _refresh_angle(self, enc):
+        """Wheel turns, angle noise (magnet check) and read errors of the angle sensor."""
+        self.labels["d_turns"].set_text(fmt(enc.get("revolutions"), 3))
+        noise = enc.get("angle_noise")
+        if noise is None:
+            self.labels["d_noise"].set_text("—")
+        elif noise >= ANGLE_NOISE_BAD:
+            # Raw angle jumps: magnet missing or too far from the chip
+            self.labels["d_noise"].set_markup(f'<span color="{BAD_COLOR}">no magnet</span>')
+        else:
+            self.labels["d_noise"].set_text(f"{noise:.2f}°")
+        errors = enc.get("angle_errors") or 0
+        self.labels["h_enc"].set_markup(
+            f'<span color="{BAD_COLOR}">{errors} err</span>' if errors else "angle"
+        )
 
     def _tick(self):
         try:
