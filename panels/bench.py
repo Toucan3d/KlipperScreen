@@ -119,6 +119,8 @@ def fmt(value, decimals, unit=""):
         text = f"{float(value):.{decimals}f}"
     except (TypeError, ValueError):
         return str(value)
+    if text.startswith("-") and float(text) == 0:
+        text = text[1:]  # noise around 0 reads "0.00", not "-0.00"
     return f"{text} {unit}" if unit else text
 
 
@@ -166,6 +168,7 @@ class Panel(ScreenPanel):
         # shift from its tare zero (JSON_SENSOR_TARE), signed so that up is more force;
         # without it, the frequency from the eddy service's live file (or a run's CSV).
         self.eddy_history = None  # (temperature_sensor with the eddy history, factor to Hz)
+        self.eddy_zero = None     # last tare zero seen, to keep the graph line on a new tare
         self.eddy_obj, self.eddy_sign = self._eddy_sensor() if self.show_force else (None, 1.0)
         pattern = main.get("bench_eddy_glob", fallback=EDDY_GLOB)
         live = main.get("bench_eddy_live", fallback=EDDY_LIVE)
@@ -531,10 +534,13 @@ class Panel(ScreenPanel):
     def _build_monitor_buttons(self):
         box = Gtk.Box(spacing=4, homogeneous=True)
         box.set_size_request(-1, round(self.base_px * 2.9))
-        box.add(self._button(_("ENC reset"), self._encoder_cmd, "ENCODER_RESET"))
-        box.add(self._button(_("Monitor start"), self._encoder_cmd,
+        # Two lines each: four buttons share the row when the eddy zero button is there
+        box.add(self._button(_("ENC\nreset"), self._encoder_cmd, "ENCODER_RESET"))
+        if self.eddy_obj:
+            box.add(self._button(_("Eddy\nzero"), self._eddy_zero))
+        box.add(self._button(_("Monitor\nstart"), self._encoder_cmd,
                              "FLOW_MONITOR_START LABEL=manual LOG=1", css="bench_go"))
-        box.add(self._button(_("Monitor stop"), self._encoder_cmd, "FLOW_MONITOR_STOP",
+        box.add(self._button(_("Monitor\nstop"), self._encoder_cmd, "FLOW_MONITOR_STOP",
                              css="bench_stop"))
         return box
 
@@ -566,6 +572,10 @@ class Panel(ScreenPanel):
     def _gcode(self, script):
         self._add_console_line("command", time.time(), script)
         self._screen._ws.api.gcode_script(script)
+
+    def _eddy_zero(self, widget):
+        # The force graph keeps its line: _sample shifts the history when the zero changes
+        self._gcode(f"JSON_SENSOR_TARE SENSOR={self.eddy_obj.split(' ', 1)[1]}")
 
     def _encoder_cmd(self, widget, command):
         if not self.encoder_name:
@@ -874,10 +884,24 @@ class Panel(ScreenPanel):
             return None
         return velocity * self.filament_area
 
+    def _follow_eddy_zero(self):
+        """After a tare (button, Mainsail or a macro) shift the history to the new zero."""
+        zero = self._stat(self.eddy_obj, "zero")
+        if isinstance(zero, (int, float)) and isinstance(self.eddy_zero, (int, float)) \
+                and zero != self.eddy_zero:
+            shift = -self.eddy_sign * (zero - self.eddy_zero)
+            buffer = self.buffers["eddy"]
+            for i, v in enumerate(buffer):
+                if v is not None:
+                    buffer[i] = v + shift
+        if zero is not None:
+            self.eddy_zero = zero
+
     def _eddy_value(self):
         """Force graph value: Hz from the tare zero, + = more force ([json_sensor]),
         else the frequency in kHz from the eddy service's live file."""
         if self.eddy_obj:
+            self._follow_eddy_zero()
             delta = self._stat(self.eddy_obj, "delta")
             return None if delta is None else self.eddy_sign * delta
         return self._eddy_khz()
