@@ -616,7 +616,7 @@ class KlipperScreenConfig:
                     "section": "main",
                     "name": _("Test bench: nozzle force graph"),
                     "type": "binary",
-                    "tooltip": _("Third graph on the test bench dashboard (load cell)"),
+                    "tooltip": _("Third graph on the test bench dashboard (eddy-current sensor)"),
                     "value": "True",
                     "callback": screen.reload_panels,
                 }

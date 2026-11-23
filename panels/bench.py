@@ -5,7 +5,7 @@ Home screen for a Klipper test bench instead of a printer. Enabled by the
 stays reachable from the "Menu" button.
 
 Left: equal-height live graphs (flow, temperatures, optional nozzle force
-with the eddy-current sensor on its own right axis).
+from the eddy-current sensor; the bench has no load cell any more).
 Right: data grid, print status (only while printing), console, favorite
 buttons (macros FAV_1..FAV_7, defined and labelled in the Klipper config),
 flow monitor buttons, nozzle buttons (extrude, retract, heat) and fan
@@ -36,7 +36,6 @@ FAV_COUNT = 7
 CONSOLE_LINES = 200
 FLOW_COLOR = "#5DCAA5"
 FLOW_SET_COLOR = "#C9CCD1"  # expected flow from the extruder move, dashed
-FORCE_COLOR = "#97C459"
 EDDY_COLOR = "#85B7EB"
 # Live file of the testbench eddy service (option bench_eddy_live, empty = not used) and,
 # without the service, the live CSVs of the recorder (bench_eddy_glob, comma separated,
@@ -44,6 +43,7 @@ EDDY_COLOR = "#85B7EB"
 EDDY_LIVE = "/dev/shm/eddy_live.json"
 EDDY_GLOB = "~/testbench/runs/*/logs/eddy*.csv"
 EDDY_MIN_SPAN_KHZ = 0.02  # the sensor noise (a few Hz) does not fill the axis
+EDDY_MIN_SPAN_HZ = 20.0
 # Angle sensor as length source: about 0.07 deg rms with the magnet in place, tens of
 # degrees without it
 ANGLE_NOISE_BAD = 1.0
@@ -145,7 +145,6 @@ class Panel(ScreenPanel):
         # Length from an [angle] sensor on the filament wheel instead of SFS edges
         enc_cfg = (self._printer.get_config_section(self.encoder) or {}) if self.encoder else {}
         self.angle_source = bool(enc_cfg.get("angle_sensor"))
-        self.load_cell = self._first_section("load_cell")
         self.show_force = self._config.get_main_config().getboolean("bench_force_graph", True)
         self.temps = self._temperature_objects()
         self.fans = [
@@ -163,16 +162,21 @@ class Panel(ScreenPanel):
         self.nozzle = {k: main.getfloat(k, fallback=v) for k, v in NOZZLE_DEFAULTS.items()}
         self.move = None
         self.heat_since = None
-        # Eddy-current force sensor: not a Klipper object, followed in the recorder's CSV
+        # Eddy-current force sensor. With Klipper's [json_sensor eddy] the graph shows the
+        # shift from its tare zero (JSON_SENSOR_TARE), signed so that up is more force;
+        # without it, the frequency from the eddy service's live file (or a run's CSV).
+        self.eddy_history = None  # (temperature_sensor with the eddy history, factor to Hz)
+        self.eddy_obj, self.eddy_sign = self._eddy_sensor() if self.show_force else (None, 1.0)
         pattern = main.get("bench_eddy_glob", fallback=EDDY_GLOB)
         live = main.get("bench_eddy_live", fallback=EDDY_LIVE)
         self.eddy = (EddyTail(pattern, live)
-                     if self.show_force and (pattern.strip() or live.strip()) else None)
+                     if self.show_force and not self.eddy_obj and (pattern.strip() or live.strip())
+                     else None)
         self.eddy_failed = False
 
         size = max(WINDOWS) * SAMPLE_HZ
         self.buffers = {"flow": deque(maxlen=size), "flow_set": deque(maxlen=size),
-                        "force": deque(maxlen=size), "eddy": deque(maxlen=size)}
+                        "eddy": deque(maxlen=size)}
         for name in self.temps:
             self.buffers[name] = deque(maxlen=size)
         self.window_index = 1
@@ -193,22 +197,27 @@ class Panel(ScreenPanel):
 
     def _prefill_from_tempstore(self):
         """Seed the graphs with Moonraker's 1 Hz history so they do not start empty."""
-        sources = {name: name for name in self.temps}
+        sources = {name: (name, None) for name in self.temps}
         flow_sensor = next(
             (n for n in self._printer.get_temp_sensors()
              if (self._printer.get_config_section(n) or {}).get("sensor_type") == "filament_flow"),
             None,
         )
         if flow_sensor:
-            sources["flow"] = flow_sensor
+            sources["flow"] = (flow_sensor, None)
+        if self.eddy_obj and self.eddy_history:
+            sources["eddy"] = self.eddy_history
         seconds = max(WINDOWS)
-        for key, device in sources.items():
+        for key, (device, factor) in sources.items():
             history = self._printer.get_temp_store(device, "temperatures", seconds) or []
             # The store is zero-padded for the time before Klipper started
             start = 0
             while start < len(history) and history[start] == 0:
                 start += 1
             values = [None] * start + list(history[start:])
+            if factor is not None:
+                # The eddy temperature sensor reads 0 while it has no value: a gap, not 0 Hz
+                values = [None if v is None or v == 0 else v * factor for v in values]
             buffer = self.buffers[key]
             buffer.clear()
             for value in values:
@@ -227,6 +236,31 @@ class Panel(ScreenPanel):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1
         )
+
+    def _eddy_sensor(self):
+        """-> ([json_sensor] of the eddy sensor or None, sign that makes more force positive).
+
+        The sign comes from the scale of a [temperature_sensor] that shows the same
+        json_sensor (scale -0.1 on the bench: the frequency drops with force)."""
+        sensors = self._printer.get_config_section_list("json_sensor ")
+        if not sensors:
+            return None, 1.0
+        obj = "json_sensor eddy" if "json_sensor eddy" in sensors else sensors[0]
+        name = obj.split(" ", 1)[1]
+        sign = -1.0
+        for section in self._printer.get_config_section_list("temperature_sensor "):
+            cfg = self._printer.get_config_section(section) or {}
+            if cfg.get("sensor_type") == "json_sensor" and cfg.get("sensor") == name:
+                try:
+                    scale = float(cfg.get("scale", 1))
+                except ValueError:
+                    continue
+                if scale:
+                    sign = -1.0 if scale < 0 else 1.0
+                    # Its 1 Hz history in Moonraker's store prefills the force graph:
+                    # temperature = delta x scale, so force = temperature / |scale|
+                    self.eddy_history = (section, 1.0 / abs(scale))
+        return obj, sign
 
     def _first_section(self, prefix):
         sections = self._printer.get_config_section_list(prefix)
@@ -333,18 +367,19 @@ class Panel(ScreenPanel):
         self.graphs.append(temp)
 
         if self.show_force:
-            force = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=True, min_span=100)
-            force.add_series(self.buffers["force"], FORCE_COLOR)
+            # Force only from the eddy-current sensor: same autoscale as before, one axis
+            span = EDDY_MIN_SPAN_HZ if self.eddy_obj else EDDY_MIN_SPAN_KHZ
+            force = BenchGraph(SAMPLE_HZ, self.small_px, zero_based=False, min_span=span)
+            force.add_series(self.buffers["eddy"], EDDY_COLOR)
             self.force_graph = force
-            # Without a load cell the eddy line alone still fills the graph
-            if not self.load_cell and self.eddy is None:
-                force.message = _("No load cell configured")
-            title = "Nozzle force [g]"
-            if self.eddy is not None:
-                force.set_right_axis(EDDY_COLOR, zero_based=False, min_span=EDDY_MIN_SPAN_KHZ)
-                force.add_series(self.buffers["eddy"], EDDY_COLOR, right=True)
-                title += f'  <span color="{EDDY_COLOR}">eddy [kHz]</span>'
-            box.add(self._graph_box(title, FORCE_COLOR, force, "force"))
+            if self.eddy_obj:
+                title = "Force (eddy) [Hz from zero]"
+            elif self.eddy is not None:
+                title = "Eddy [kHz]"
+            else:
+                title = "Force"
+                force.message = _("No eddy-current sensor")
+            box.add(self._graph_box(title, EDDY_COLOR, force, "force"))
             self.graphs.append(force)
 
         for graph in self.graphs:
@@ -375,15 +410,16 @@ class Panel(ScreenPanel):
 
     def _build_data(self):
         if self.angle_source:
+            # Magnetic encoder (AS5047P) as length source; the SFS still counts beside it
             enc = [("abs", "abs"), ("rel", "rel"), ("turns", "turns"), ("noise", "noise"),
-                   ("speed", "speed"), ("flowv", "flow")]
+                   ("speed", "speed"), ("flowv", "flow"), ("sfs", "SFS")]
         else:
             enc = [("abs", "abs"), ("rel", "rel"), ("edges", "edges"), ("mpe", "mm/edge"),
                    ("speed", "speed"), ("flowv", "flow")]
         mon = [("label", "label"), ("elapsed", "elapsed"), ("last", "last"), ("dur", "dur"),
                ("len", "len"), ("qavg", "Q avg/max")]
         sen = [(f"t_{n}", self._short(n)) for n in self.temps[:3]]
-        sen += [("force", "force"), ("fmax", "F max"), ("runout", "runout"), ("ratio", "ratio")]
+        sen += [("eddy", "eddy"), ("emax", "eddy max"), ("runout", "runout"), ("ratio", "ratio")]
         columns = [("Encoder", "h_enc", enc), ("Monitor", "h_mon", mon), ("Sensors", "h_sen", sen)]
 
         grid = Gtk.Grid(column_spacing=4, row_spacing=0, column_homogeneous=False)
@@ -831,21 +867,25 @@ class Panel(ScreenPanel):
             return None
         return self._printer.get_stat(obj, field) if obj in self._printer.data else None
 
-    def _force(self):
-        if not self.load_cell:
-            return None
-        data = self._printer.data.get(self.load_cell, {})
-        for field in ("force_g", "force"):
-            if isinstance(data.get(field), (int, float)):
-                return data[field]
-        return None
-
     def _flow_set(self):
         """Expected flow: live extruder velocity times the filament cross-section."""
         velocity = self._stat("motion_report", "live_extruder_velocity")
         if velocity is None or not self.extruder:
             return None
         return velocity * self.filament_area
+
+    def _eddy_value(self):
+        """Force graph value: Hz from the tare zero, + = more force ([json_sensor]),
+        else the frequency in kHz from the eddy service's live file."""
+        if self.eddy_obj:
+            delta = self._stat(self.eddy_obj, "delta")
+            return None if delta is None else self.eddy_sign * delta
+        return self._eddy_khz()
+
+    def _eddy_text(self, value):
+        if value is None:
+            return "—"
+        return f"{value:+.0f} Hz" if self.eddy_obj else f"{value:.3f} kHz"
 
     def _eddy_khz(self):
         if self.eddy is None or self.eddy_failed:
@@ -866,8 +906,7 @@ class Panel(ScreenPanel):
             self._prefill_from_tempstore()
         self.buffers["flow"].append(self._stat(self.encoder, "flow"))
         self.buffers["flow_set"].append(self._flow_set())
-        self.buffers["force"].append(self._force())
-        self.buffers["eddy"].append(self._eddy_khz())
+        self.buffers["eddy"].append(self._eddy_value())
         for name in self.temps:
             self.buffers[name].append(self._stat(name, "temperature"))
         return True
@@ -902,13 +941,10 @@ class Panel(ScreenPanel):
 
         for name in self.temps[:3]:
             set_(f"d_t_{name}", fmt(self._stat(name, "temperature"), 2, "°C"))
-        force = self._force()
-        set_("d_force", fmt(force, 0, "g"))
-        if self.load_cell and getattr(self, "force_graph", None) is not None:
-            calibrated = self._printer.data.get(self.load_cell, {}).get("is_calibrated", True)
-            self.force_graph.message = None if calibrated else _("Load cell not calibrated")
-        values = [v for v in self.buffers["force"] if v is not None]
-        set_("d_fmax", fmt(max(values), 0, "g") if values else "—")
+        eddy = self.buffers["eddy"][-1] if self.buffers["eddy"] else None
+        set_("d_eddy", self._eddy_text(eddy))
+        values = [v for v in self.buffers["eddy"] if v is not None]
+        set_("d_emax", self._eddy_text(max(values)) if values else "—")
         if self.runout:
             data = self._printer.data.get(self.runout, {})
             if not data.get("enabled", True):
@@ -933,16 +969,7 @@ class Panel(ScreenPanel):
         ]
         self.labels["title_temp"].set_markup('<span color="#C9CCD1">°C</span>  ' + "  ".join(parts))
         if "cur_force" in self.labels:
-            text = f'<span color="{FORCE_COLOR}">{fmt(force, 0)}</span>'
-            if self.eddy is not None:
-                khz = self.buffers["eddy"][-1] if self.buffers["eddy"] else None
-                if khz is None:
-                    # Why: no PCB, service off, not recording (see bench_eddy.py)
-                    status = GLib.markup_escape_text(self.eddy.status or "no value")
-                    text += f'  <span color="#6B7480">eddy: {status}</span>'
-                else:
-                    text += f'  <span color="{EDDY_COLOR}">{fmt(khz, 3)}</span>'
-            self.labels["cur_force"].set_markup(text)
+            self.labels["cur_force"].set_markup(self._force_header(eddy))
 
         self._refresh_print()
         self._refresh_nozzle()
@@ -953,9 +980,33 @@ class Panel(ScreenPanel):
             if fan not in self.fan_dragging:
                 widgets["scale"].set_value(speed * 100)
 
+    def _force_header(self, value):
+        """Current eddy force (and the frequency itself), or why there is none."""
+        grey = "#6B7480"
+        if self.eddy_obj:
+            data = self._printer.data.get(self.eddy_obj, {})
+            if value is None:
+                state = GLib.markup_escape_text(str(data.get("state") or "no data"))
+                return f'<span color="{grey}">eddy: {state}</span>'
+            khz = data.get("value")
+            return (f'<span color="{EDDY_COLOR}">{self._eddy_text(value)}</span>'
+                    + (f'  <span color="{grey}">{khz / 1000:.3f} kHz</span>'
+                       if isinstance(khz, (int, float)) else ""))
+        if self.eddy is not None:
+            if value is None:
+                # Why: no PCB, service off, not recording (see bench_eddy.py)
+                status = GLib.markup_escape_text(self.eddy.status or "no value")
+                return f'<span color="{grey}">eddy: {status}</span>'
+            return f'<span color="{EDDY_COLOR}">{self._eddy_text(value)}</span>'
+        return ""
+
     def _refresh_angle(self, enc):
-        """Wheel turns, angle noise (magnet check) and read errors of the angle sensor."""
+        """Wheel turns, angle noise (magnet check), read errors and the SFS length beside it."""
         self.labels["d_turns"].set_text(fmt(enc.get("revolutions"), 3))
+        sfs_edges, mpe = enc.get("sfs_edges"), enc.get("mm_per_edge")
+        self.labels["d_sfs"].set_text(
+            fmt(sfs_edges * mpe, 1, "mm")
+            if isinstance(sfs_edges, (int, float)) and isinstance(mpe, (int, float)) else "—")
         noise = enc.get("angle_noise")
         if noise is None:
             self.labels["d_noise"].set_text("—")
@@ -966,7 +1017,7 @@ class Panel(ScreenPanel):
             self.labels["d_noise"].set_text(f"{noise:.2f}°")
         errors = enc.get("angle_errors") or 0
         self.labels["h_enc"].set_markup(
-            f'<span color="{BAD_COLOR}">{errors} err</span>' if errors else "angle"
+            f'<span color="{BAD_COLOR}">{errors} err</span>' if errors else "magnetic"
         )
 
     def _tick(self):

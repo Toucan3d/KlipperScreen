@@ -384,8 +384,8 @@ class KlipperScreen(Gtk.ApplicationWindow):
             requested_updates["objects"][p] = ["value"]
         for led in self.printer.get_leds():
             requested_updates["objects"][led] = ["color_data"]
-        # Test bench sensors (filament encoder, load cell): all fields
-        for prefix in ("filament_encoder ", "load_cell"):
+        # Test bench sensors (filament encoder, eddy-current json_sensor): all fields
+        for prefix in ("filament_encoder ", "json_sensor "):
             for obj in self.printer.get_config_section_list(prefix):
                 requested_updates["objects"][obj] = None
 
